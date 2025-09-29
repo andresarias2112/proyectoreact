@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import toast from "react-hot-toast";
 
 interface Task {
@@ -17,6 +17,31 @@ interface TaskListProps {
   onLogout: () => void;
 }
 
+const GLOBAL_KEY = "tasks_global";
+
+function normalizeKey(name: string) {
+  return encodeURIComponent(name.trim().toLowerCase().replace(/\s+/g, "_"));
+}
+
+function safeParseTasks(raw: string | null): Task[] | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    // Optional: basic shape check
+    return parsed.map((p: any) => ({
+      id: Number(p.id) || Date.now(),
+      author: String(p.author || "unknown"),
+      title: String(p.title || ""),
+      description: String(p.description || ""),
+      completed: !!p.completed,
+    }));
+  } catch (e) {
+    console.warn("safeParseTasks: JSON parse error:", e);
+    return null;
+  }
+}
+
 export default function TaskList({ user, role, onLogout }: TaskListProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [title, setTitle] = useState("");
@@ -27,16 +52,121 @@ export default function TaskList({ user, role, onLogout }: TaskListProps) {
   const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
 
-  useEffect(() => {
-    const savedTasks = localStorage.getItem("tasks");
-    if (savedTasks) setTasks(JSON.parse(savedTasks));
-  }, []);
+  const userKey = user ? `tasks_${normalizeKey(user)}` : null;
 
+  // Ref para evitar sobrescribir storage en el primer render/carga
+  const didFinishInitialLoadRef = useRef(false);
+
+  // CARGA: cargar tareas desde localStorage (creator -> userKey || global, viewer -> global || user)
   useEffect(() => {
-    localStorage.setItem("tasks", JSON.stringify(tasks));
-  }, [tasks]);
+    // Desactivar guardado mientras cargamos
+    didFinishInitialLoadRef.current = false;
+
+    if (!user) {
+      setTasks([]);
+      // marcar cargado en siguiente frame para que el efecto de guardado posterior funcione
+      requestAnimationFrame(() => {
+        didFinishInitialLoadRef.current = true;
+      });
+      return;
+    }
+
+    try {
+      const globalRaw = localStorage.getItem(GLOBAL_KEY);
+      const userRaw = userKey ? localStorage.getItem(userKey) : null;
+
+      let parsed: Task[] | null = null;
+
+      if (role === "creator") {
+        // Si el creator tiene su propia clave, la usamos; si no, fallback al global
+        parsed = safeParseTasks(userRaw) ?? safeParseTasks(globalRaw);
+      } else {
+        // Viewer: preferimos global, si no existe fallback al user
+        parsed = safeParseTasks(globalRaw) ?? safeParseTasks(userRaw);
+      }
+
+      if (parsed) {
+        setTasks(parsed);
+        console.debug("[TaskList] loaded tasks:", parsed);
+      } else {
+        setTasks([]);
+        console.debug("[TaskList] no tasks found, starting empty");
+      }
+    } catch (err) {
+      console.error("[TaskList] error reading storage:", err);
+      setTasks([]);
+    } finally {
+      // Marcar que la carga inicial terminó en el siguiente frame (evita race con el efecto de guardado)
+      requestAnimationFrame(() => {
+        didFinishInitialLoadRef.current = true;
+      });
+    }
+  }, [user, role, userKey]);
+
+  // GUARDADO: solo después de que la carga inicial haya terminado
+  useEffect(() => {
+    if (!user) return;
+    if (!didFinishInitialLoadRef.current) {
+      // evitamos pisar storage con el estado inicial vacío
+      console.debug("[TaskList] skip save during initial load");
+      return;
+    }
+
+    try {
+      const payload = JSON.stringify(tasks || []);
+      if (role === "creator") {
+        if (userKey) {
+          localStorage.setItem(userKey, payload);
+          console.debug("[TaskList] saved to", userKey, tasks);
+        }
+        // actualizar global para viewers: aquí mantenemos la misma estrategia (global = última versión del creator)
+        localStorage.setItem(GLOBAL_KEY, payload);
+        console.debug("[TaskList] saved to", GLOBAL_KEY);
+      } else {
+        // viewer no guarda
+      }
+    } catch (err) {
+      console.error("[TaskList] error saving to localStorage:", err);
+    }
+  }, [tasks, user, role, userKey]);
+
+  // Sincronizar cambios hechos en otras pestañas (storage event)
+  useEffect(() => {
+    function onStorage(e: StorageEvent) {
+      if (!user) return;
+      if (e.key === GLOBAL_KEY || e.key === userKey) {
+        // Volver a cargar desde storage pero sin desactivar el guardado (ya que la carga ya ocurrió)
+        try {
+          const raw = localStorage.getItem(e.key || "");
+          const parsed = safeParseTasks(raw);
+          if (parsed) {
+            setTasks(parsed);
+            console.debug("[TaskList] storage event loaded tasks from", e.key);
+          } else {
+            // si se borró la clave -> limpiar
+            setTasks([]);
+            console.debug("[TaskList] storage event: key cleared", e.key);
+          }
+        } catch (err) {
+          console.warn("[TaskList] storage event parse error", err);
+        }
+      }
+    }
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [userKey, user]);
+
+  // Helpers
+  const ensureCreator = (actionName = "realizar esta acción") => {
+    if (role !== "creator") {
+      toast.error("No tienes permisos para " + actionName);
+      return false;
+    }
+    return true;
+  };
 
   const addTask = () => {
+    if (!ensureCreator("añadir tareas")) return;
     if (title.trim() === "") {
       toast.error("El título no puede estar vacío");
       return;
@@ -48,28 +178,31 @@ export default function TaskList({ user, role, onLogout }: TaskListProps) {
       description: description.trim(),
       completed: false,
     };
-    setTasks([...tasks, newTask]);
+    setTasks((prev) => [...prev, newTask]);
     setTitle("");
     setDescription("");
     toast.success("Tarea añadida ✅");
   };
 
   const toggleTask = (id: number) => {
-    setTasks(tasks.map((t) =>
-      t.id === id ? { ...t, completed: !t.completed } : t
-    ));
+    if (!ensureCreator("cambiar el estado")) return;
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, completed: !t.completed } : t)));
     toast("Estado actualizado");
   };
 
   const deleteTask = (id: number) => {
-    setTasks(tasks.filter((t) => t.id !== id));
+    if (!ensureCreator("eliminar tareas")) return;
+    setTasks((prev) => prev.filter((t) => t.id !== id));
     toast.error("Tarea eliminada ❌");
   };
 
   const saveEdit = (id: number) => {
-    setTasks(tasks.map((t) =>
-      t.id === id ? { ...t, title: editTitle, description: editDescription } : t
-    ));
+    if (!ensureCreator("editar tareas")) return;
+    if (editTitle.trim() === "") {
+      toast.error("El título no puede quedar vacío");
+      return;
+    }
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, title: editTitle.trim(), description: editDescription.trim() } : t)));
     setEditingId(null);
     setEditTitle("");
     setEditDescription("");
@@ -77,11 +210,14 @@ export default function TaskList({ user, role, onLogout }: TaskListProps) {
   };
 
   const filteredTasks = tasks
-    .filter((t) =>
-      t.title.toLowerCase().includes(filter.toLowerCase()) ||
-      t.author.toLowerCase().includes(filter.toLowerCase()) ||
-      t.description.toLowerCase().includes(filter.toLowerCase())
-    )
+    .filter((t) => {
+      const q = filter.toLowerCase();
+      return (
+        t.title.toLowerCase().includes(q) ||
+        t.author.toLowerCase().includes(q) ||
+        t.description.toLowerCase().includes(q)
+      );
+    })
     .filter((t) => {
       if (statusFilter === "completed") return t.completed;
       if (statusFilter === "pending") return !t.completed;
@@ -138,10 +274,10 @@ export default function TaskList({ user, role, onLogout }: TaskListProps) {
 
       {/* Filtros */}
       <div className="flex gap-3 mb-6">
-        {["all", "completed", "pending"].map((status) => (
+        {(["all", "completed", "pending"] as const).map((status) => (
           <button
             key={status}
-            onClick={() => setStatusFilter(status as any)}
+            onClick={() => setStatusFilter(status)}
             className={`px-4 py-2 rounded-xl font-bold shadow transition ${
               statusFilter === status
                 ? "bg-gradient-to-r from-pink-400 to-pink-500 text-white"
@@ -178,18 +314,10 @@ export default function TaskList({ user, role, onLogout }: TaskListProps) {
               </div>
             ) : (
               <div>
-                <h2
-                  className={`text-lg font-semibold ${
-                    task.completed ? "line-through text-white/70" : ""
-                  }`}
-                >
+                <h2 className={`text-lg font-semibold ${task.completed ? "line-through text-white/70" : ""}`}>
                   {task.title}
                 </h2>
-                <p
-                  className={`text-sm mt-1 ${
-                    task.completed ? "line-through text-white/70" : ""
-                  }`}
-                >
+                <p className={`text-sm mt-1 ${task.completed ? "line-through text-white/70" : ""}`}>
                   {task.description}
                 </p>
                 <span className="text-xs text-white/60">Autor: {task.author}</span>
