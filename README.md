@@ -53,7 +53,7 @@ proyectoreact/
 
 
 
-⚙️ Flujo de la aplicación
+-⚙️ Flujo de la aplicación
 
 Inicio:
 
@@ -122,7 +122,7 @@ npm run dev
 # 5️⃣ Abrir en el navegador
 # URL por defecto: http://localhost:5173/
 
-📌 Detalles adicionales
+-📌 Detalles adicionales
 
 La aplicación está diseñada para ser responsiva, funcionando en escritorio y dispositivos móviles.
 
